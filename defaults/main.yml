@@ -1,0 +1,13 @@
+---
+# Install path for Kubernetes Goat on the target VM
+ludus_kubernetes_goat_install_path: /opt/kubernetes-goat
+
+# k3s version to install
+ludus_kubernetes_goat_k3s_version: "v1.28.5+k3s1"
+
+# Helm version to install
+ludus_kubernetes_goat_helm_version: "v3.14.0"
+
+# Kubernetes Goat repo and branch
+ludus_kubernetes_goat_repo: "https://github.com/madhuakula/kubernetes-goat.git"
+ludus_kubernetes_goat_repo_version: "master"

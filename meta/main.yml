@@ -1,0 +1,25 @@
+galaxy_info:
+  role_name: ludus_kubernetes_goat
+  author: bu5h-d
+  description: >
+    Deploys Kubernetes Goat (vulnerable-by-design K8s cluster) on a Ludus
+    range VM using k3s and Helm.
+  license: MIT
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Debian
+      versions:
+        - bullseye
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - jammy
+  galaxy_tags:
+    - kubernetes
+    - security
+    - ludus
+    - vulnerable
+    - k8s
+    - training
+
+dependencies: []

@@ -1,0 +1,299 @@
+---
+# =============================================================================
+# Ansible Role : ludus_kubernetes_goat
+# Description  : Deploys Kubernetes Goat on a Debian based Ludus VM
+#                using k3s and Helm.
+# Access       : http://<VM_IP>:1234 after deployment
+# Scenarios    : 1230 1231 1232 1233 1234 1235 1236
+# Tear down    : bash /opt/kubernetes-goat/teardown-kubernetes-goat.sh
+# =============================================================================
+
+# ── 1. Prerequisites ──────────────────────────────────────────────────────────
+
+- name: kubernetes-goat | Install prerequisite packages
+  ansible.builtin.apt:
+    name: [curl, wget, git, ca-certificates, jq]
+    state: present
+    update_cache: true
+
+# ── 2. k3s ────────────────────────────────────────────────────────────────────
+
+- name: kubernetes-goat | Check if k3s is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+
+- name: kubernetes-goat | Download k3s install script
+  ansible.builtin.get_url:
+    url: https://get.k3s.io
+    dest: /tmp/k3s_install.sh
+    mode: "0755"
+  when: not k3s_binary.stat.exists
+
+- name: kubernetes-goat | Install k3s
+  ansible.builtin.shell: |
+    INSTALL_K3S_VERSION="{{ ludus_kubernetes_goat_k3s_version }}" \
+    INSTALL_K3S_EXEC="server \
+      --disable traefik \
+      --disable servicelb \
+      --kube-apiserver-arg=allow-privileged=true \
+      --disable-network-policy" \
+    bash /tmp/k3s_install.sh
+  environment:
+    HOME: /root
+  args:
+    creates: /etc/rancher/k3s/k3s.yaml
+  when: not k3s_binary.stat.exists
+
+- name: kubernetes-goat | Wait for k3s kubeconfig to be created
+  ansible.builtin.wait_for:
+    path: /etc/rancher/k3s/k3s.yaml
+    timeout: 120
+
+- name: kubernetes-goat | Wait for k3s node to be Ready
+  ansible.builtin.shell: kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: node_ready
+  until: node_ready.rc == 0 and node_ready.stdout | int >= 1
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: kubernetes-goat | Set KUBECONFIG globally
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^KUBECONFIG='
+    line: "KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
+    create: true
+    mode: "0644"
+
+# ── 3. Helm ───────────────────────────────────────────────────────────────────
+
+- name: kubernetes-goat | Check if helm is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/helm
+  register: helm_binary
+
+- name: kubernetes-goat | Download helm install script
+  ansible.builtin.get_url:
+    url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+    dest: /tmp/get_helm.sh
+    mode: "0755"
+  when: not helm_binary.stat.exists
+
+- name: kubernetes-goat | Install helm {{ ludus_kubernetes_goat_helm_version }}
+  ansible.builtin.shell: |
+    DESIRED_VERSION="{{ ludus_kubernetes_goat_helm_version }}" bash /tmp/get_helm.sh
+  environment:
+    HOME: /root
+  args:
+    creates: /usr/local/bin/helm
+  when: not helm_binary.stat.exists
+
+# ── 4. Kubernetes Goat ────────────────────────────────────────────────────────
+
+- name: kubernetes-goat | Check if Goat is already deployed
+  ansible.builtin.stat:
+    path: "{{ ludus_kubernetes_goat_install_path }}/setup-kubernetes-goat.sh"
+  register: goat_installed
+
+- name: kubernetes-goat | Clone Kubernetes Goat repository
+  ansible.builtin.git:
+    repo: "{{ ludus_kubernetes_goat_repo }}"
+    dest: "{{ ludus_kubernetes_goat_install_path }}"
+    version: "{{ ludus_kubernetes_goat_repo_version }}"
+    force: true
+  environment:
+    GIT_TERMINAL_PROMPT: "0"
+
+- name: kubernetes-goat | Make Goat scripts executable
+  ansible.builtin.file:
+    path: "{{ ludus_kubernetes_goat_install_path }}/{{ item }}"
+    mode: "0755"
+  loop:
+    - setup-kubernetes-goat.sh
+    - teardown-kubernetes-goat.sh
+    - access-kubernetes-goat.sh
+
+- name: kubernetes-goat | Run setup-kubernetes-goat.sh
+  ansible.builtin.shell: |
+    cd {{ ludus_kubernetes_goat_install_path }} && bash setup-kubernetes-goat.sh 2>&1
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+    HOME: /root
+  when: not goat_installed.stat.exists
+  changed_when: true
+
+# ── 5. Fix: health-check mounts Docker socket, k3s uses containerd ────────────
+#
+# Kubernetes Goat mounts /var/run/docker.sock for the DIND scenario.
+# k3s does not use Docker — its containerd socket is at:
+# /run/k3s/containerd/containerd.sock
+# We patch the deployment to use the correct path.
+
+- name: kubernetes-goat | Patch health-check-deployment to use k3s containerd socket
+  ansible.builtin.shell: |
+    kubectl patch deployment health-check-deployment -n default \
+      --type=json \
+      -p='[{"op":"replace","path":"/spec/template/spec/volumes/0/hostPath/path","value":"/run/k3s/containerd/containerd.sock"},{"op":"replace","path":"/spec/template/spec/volumes/0/hostPath/type","value":"Socket"}]' \
+      2>/dev/null || true
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: true
+
+- name: kubernetes-goat | Restart health-check pod to apply socket fix
+  ansible.builtin.shell: |
+    kubectl delete pod -n default -l app=health-check --ignore-not-found=true
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: true
+
+# ── 6. Fix: hidden-in-layers and batch-check are Jobs (restartPolicy: Never) ──
+#
+# Kubernetes Jobs with restartPolicy: Never do not restart after a reboot.
+# We replace them with Deployments so k3s manages them like all other pods
+# and they come back automatically after every reboot.
+
+- name: kubernetes-goat | Write hidden-in-layers Deployment manifest
+  ansible.builtin.copy:
+    dest: "{{ ludus_kubernetes_goat_install_path }}/scenarios/hidden-in-layers/deployment.yaml"
+    mode: "0644"
+    content: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: hidden-in-layers
+        namespace: default
+        labels:
+          app: hidden-in-layers
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: hidden-in-layers
+        template:
+          metadata:
+            labels:
+              app: hidden-in-layers
+          spec:
+            containers:
+              - name: hidden-in-layers
+                image: madhuakula/k8s-goat-hidden-in-layers
+
+- name: kubernetes-goat | Write batch-check Deployment manifest
+  ansible.builtin.copy:
+    dest: "{{ ludus_kubernetes_goat_install_path }}/scenarios/batch-check/job.yaml"
+    mode: "0644"
+    content: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: batch-check-job
+        namespace: default
+        labels:
+          app: batch-check
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: batch-check
+        template:
+          metadata:
+            labels:
+              app: batch-check
+          spec:
+            containers:
+              - name: batch-check
+                image: madhuakula/k8s-goat-batch-check
+
+- name: kubernetes-goat | Delete original Jobs and apply Deployments
+  ansible.builtin.shell: |
+    kubectl delete job hidden-in-layers batch-check-job -n default --ignore-not-found=true
+    kubectl apply -f {{ ludus_kubernetes_goat_install_path }}/scenarios/hidden-in-layers/deployment.yaml
+    kubectl apply -f {{ ludus_kubernetes_goat_install_path }}/scenarios/batch-check/job.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: true
+
+# ── 7. Wait for all pods ──────────────────────────────────────────────────────
+
+- name: kubernetes-goat | Wait for all pods to be Running or Completed
+  ansible.builtin.shell: |
+    kubectl get pods -A --no-headers 2>/dev/null \
+      | grep -v -E "(Running|Completed|Terminating)" \
+      | grep -v "NAME" \
+      | wc -l
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: pods_not_ready
+  until: pods_not_ready.stdout | int == 0
+  retries: 60
+  delay: 15
+  changed_when: false
+
+# ── 8. Access ─────────────────────────────────────────────────────────────────
+#
+# access-kubernetes-goat.sh uses kubectl port-forward --address 0.0.0.0
+# to expose all scenarios at the VM's IP on ports 1230-1236.
+#
+# A cron job re-runs the script on every reboot so scenarios are always
+# accessible without any manual intervention.
+#
+# The cron job sets PATH and KUBECONFIG inline since cron does not
+# inherit shell environment variables.
+
+- name: kubernetes-goat | Install reboot cron job for port-forwards
+  ansible.builtin.copy:
+    dest: /etc/cron.d/kubernetes-goat-access
+    mode: "0644"
+    content: |
+      @reboot root sleep 120 && PATH=/usr/local/bin:$PATH KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /opt/kubernetes-goat/access-kubernetes-goat.sh --kubeconfig /etc/rancher/k3s/k3s.yaml > /var/log/kubernetes-goat-access.log 2>&1
+
+- name: kubernetes-goat | Kill any existing port-forwards
+  ansible.builtin.shell: pkill -f "kubectl.*port-forward" 2>/dev/null || true
+  changed_when: false
+  failed_when: false
+
+- name: kubernetes-goat | Run access-kubernetes-goat.sh
+  ansible.builtin.shell: |
+    nohup bash {{ ludus_kubernetes_goat_install_path }}/access-kubernetes-goat.sh \
+      --kubeconfig /etc/rancher/k3s/k3s.yaml \
+      > /var/log/kubernetes-goat-access.log 2>&1 &
+  environment:
+    HOME: /root
+  changed_when: true
+
+- name: kubernetes-goat | Wait for home UI to be accessible
+  ansible.builtin.wait_for:
+    port: 1234
+    host: 127.0.0.1
+    timeout: 120
+    delay: 5
+
+# ── 9. Summary ────────────────────────────────────────────────────────────────
+
+- name: kubernetes-goat | Get VM IP address
+  ansible.builtin.shell: hostname -I | awk '{print $1}'
+  register: vm_ip
+  changed_when: false
+
+- name: kubernetes-goat | Print access summary
+  ansible.builtin.debug:
+    msg: |
+      ============================================================
+       Kubernetes Goat is ready!
+      ============================================================
+       Home UI  : http://{{ vm_ip.stdout }}:1234
+
+       Scenarios:
+         http://{{ vm_ip.stdout }}:1230  #1  Sensitive keys in codebases
+         http://{{ vm_ip.stdout }}:1231  #2  DIND exploitation
+         http://{{ vm_ip.stdout }}:1232  #3  SSRF in K8s world
+         http://{{ vm_ip.stdout }}:1233  #4  Container escape
+         http://{{ vm_ip.stdout }}:1235  #7  Attacking private registry
+         http://{{ vm_ip.stdout }}:1236  #13 DoS resources
+
+       Logs     : /var/log/kubernetes-goat-access.log
+       Tear down: bash /opt/kubernetes-goat/teardown-kubernetes-goat.sh
+      ============================================================
