@@ -65,13 +65,13 @@ ludus:
       snapshot: false
       block_internet: false
     roles:
-      - bu5h.ludus_kubernetes_goat
+      - bu5h-d.ludus_kubernetes_goat
 ```
 
 ## Ludus Setup
 ```bash
 # Add the role to your Ludus host
-ludus ansible roles add bu5h.ludus_kubernetes_goat
+ludus ansible roles add bu5h-d.ludus_kubernetes_goat
 
 # Get your range config
 ludus range config get > config.yml
