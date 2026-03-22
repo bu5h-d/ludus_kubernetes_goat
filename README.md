@@ -26,7 +26,7 @@ Kubernetes Goat is a **vulnerable-by-design** Kubernetes cluster with 22 securit
 
 - Debian based OS (`debian-12-x64-server-template` recommended)
 - 4 vCPU / 8 GB RAM minimum
-- `block_internet: false` — the role pulls ~2 GB of container images on first deploy
+- `block_internet: false` — The VM must have internet access during deployment
 
 ## Role Variables
 
